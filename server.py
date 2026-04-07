@@ -1,9 +1,13 @@
 from __future__ import annotations
 
 import json
+import queue
+import threading
+import uuid
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import parse_qs, urlparse
 
 
 @dataclass(frozen=True)
@@ -38,7 +42,11 @@ TOOL_DEFINITION: Dict[str, Any] = {
         "required": ["battery_percent", "destination"],
         "additionalProperties": False,
     },
+    "annotations": {"readOnlyHint": True, "openWorldHint": False, "destructiveHint": False},
 }
+
+_SESSIONS: Dict[str, queue.Queue[str]] = {}
+_SESSIONS_LOCK = threading.Lock()
 
 
 def estimate_minutes(battery_percent: int, power_kw: int, charge_now: bool) -> int:
@@ -122,7 +130,7 @@ def handle_mcp(payload: Dict[str, Any]) -> Dict[str, Any]:
             request_id,
             {
                 "protocolVersion": "2025-03-26",
-                "serverInfo": {"name": "charging-planner", "version": "1.0.0"},
+                "serverInfo": {"name": "charging-planner", "version": "1.1.0"},
                 "capabilities": {"tools": {"listChanged": False}},
             },
         )
@@ -161,14 +169,29 @@ def handle_mcp(payload: Dict[str, Any]) -> Dict[str, Any]:
     return mcp_error(request_id, -32601, f"Method not found: {method}")
 
 
-class ChargingPlannerHandler(BaseHTTPRequestHandler):
-    server_version = "ChargingPlannerHTTP/1.0"
+def _new_session() -> str:
+    session_id = str(uuid.uuid4())
+    with _SESSIONS_LOCK:
+        _SESSIONS[session_id] = queue.Queue()
+    return session_id
 
-    def _send_json(self, payload: Dict[str, Any], status: int = 200) -> None:
+
+def _get_session(session_id: str) -> Optional[queue.Queue[str]]:
+    with _SESSIONS_LOCK:
+        return _SESSIONS.get(session_id)
+
+
+class ChargingPlannerHandler(BaseHTTPRequestHandler):
+    server_version = "ChargingPlannerHTTP/1.1"
+
+    def _send_json(self, payload: Dict[str, Any], status: int = 200, extra_headers: Optional[Dict[str, str]] = None) -> None:
         body = json.dumps(payload).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
+        if extra_headers:
+            for k, v in extra_headers.items():
+                self.send_header(k, v)
         self.end_headers()
         self.wfile.write(body)
 
@@ -180,52 +203,100 @@ class ChargingPlannerHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def do_GET(self) -> None:
-        if self.path == "/health":
-            self._send_json({"status": "ok", "app": "charging-planner", "version": "1.0.0"})
-            return
-        if self.path == "/privacy":
-            self._send_text("Charging Planner v1 stores no personal data server-side and uses fixed mock station data.")
-            return
-        if self.path == "/terms":
-            self._send_text("Charging Planner v1 provides deterministic planning guidance for testing only, not driving safety advice.")
-            return
-        if self.path == "/support":
-            self._send_text("Support: charging-planner@example.com")
-            return
-        if self.path == "/.well-known/openai-apps-challenge":
-            self._send_text("charging-planner-v1-challenge")
-            return
-        if self.path == "/mcp":
-            self._send_json(
-                {
-                    "name": "charging-planner-mcp",
-                    "transport": "HTTP JSON-RPC 2.0",
-                    "endpoint": "/mcp",
-                    "supports": ["initialize", "notifications/initialized", "tools/list", "tools/call"],
-                }
-            )
-            return
-
-        self._send_text("Not Found", status=404)
-
-    def do_POST(self) -> None:
-        if self.path != "/mcp":
-            self._send_text("Not Found", status=404)
-            return
-
+    def _read_json_body(self) -> Optional[Dict[str, Any]]:
         content_length = int(self.headers.get("Content-Length", "0"))
         raw = self.rfile.read(content_length)
         try:
             payload = json.loads(raw.decode("utf-8"))
             if not isinstance(payload, dict):
                 raise ValueError("payload must be object")
+            return payload
         except Exception:
-            self._send_json(mcp_error(None, -32700, "Parse error"), status=400)
+            return None
+
+    def do_GET(self) -> None:
+        parsed = urlparse(self.path)
+
+        if parsed.path == "/health":
+            self._send_json({"status": "ok", "app": "charging-planner", "version": "1.1.0"})
+            return
+        if parsed.path == "/privacy":
+            self._send_text("Charging Planner v1 stores no personal data server-side and uses fixed mock station data.")
+            return
+        if parsed.path == "/terms":
+            self._send_text("Charging Planner v1 provides deterministic planning guidance for testing only, not driving safety advice.")
+            return
+        if parsed.path == "/support":
+            self._send_text("Support: charging-planner@example.com")
+            return
+        if parsed.path == "/.well-known/openai-apps-challenge":
+            self._send_text("charging-planner-v1-challenge")
             return
 
-        response = handle_mcp(payload)
-        self._send_json(response)
+        # Official examples compatibility: SSE stream initialization endpoint.
+        if parsed.path == "/mcp":
+            session_id = _new_session()
+            post_path = f"/mcp/messages?sessionId={session_id}"
+
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Connection", "keep-alive")
+            self.end_headers()
+
+            self.wfile.write(f"event: endpoint\ndata: {post_path}\n\n".encode("utf-8"))
+            self.wfile.flush()
+
+            q = _get_session(session_id)
+            if q is None:
+                return
+
+            try:
+                while True:
+                    try:
+                        msg = q.get(timeout=20)
+                        self.wfile.write(f"event: message\ndata: {msg}\n\n".encode("utf-8"))
+                    except queue.Empty:
+                        self.wfile.write(b": ping\n\n")
+                    self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError):
+                return
+
+        self._send_text("Not Found", status=404)
+
+    def do_POST(self) -> None:
+        parsed = urlparse(self.path)
+
+        # Streamable HTTP compatibility endpoint.
+        if parsed.path == "/mcp":
+            payload = self._read_json_body()
+            if payload is None:
+                self._send_json(mcp_error(None, -32700, "Parse error"), status=400)
+                return
+            response = handle_mcp(payload)
+            extra = {"Mcp-Session-Id": str(uuid.uuid4())}
+            self._send_json(response, status=200, extra_headers=extra)
+            return
+
+        # Official examples compatibility: POST /mcp/messages?sessionId=...
+        if parsed.path == "/mcp/messages":
+            session_id = parse_qs(parsed.query).get("sessionId", [""])[0]
+            q = _get_session(session_id)
+            if not session_id or q is None:
+                self._send_text("Unknown session", status=404)
+                return
+
+            payload = self._read_json_body()
+            if payload is None:
+                self._send_json(mcp_error(None, -32700, "Parse error"), status=400)
+                return
+
+            response = handle_mcp(payload)
+            q.put(json.dumps(response, ensure_ascii=False))
+            self._send_text("accepted", status=202)
+            return
+
+        self._send_text("Not Found", status=404)
 
 
 def run_server(host: str = "0.0.0.0", port: int = 8000) -> None:
