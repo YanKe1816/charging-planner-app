@@ -1,30 +1,29 @@
 # Charging Planner (ChatGPT Task App)
 
-Charging Planner is a single-purpose MCP task app that makes one deterministic EV decision:
+Charging Planner 是一个单用途 MCP 工具应用，业务决策逻辑保持不变：
 
-- **Charge now** or **charge near destination**
-- with one **best station**, one **optional backup**, up to **3 reasons**,
-- **detour needed** flag, and **estimated charging minutes**.
+- 在 **charge now** 与 **charge near destination** 之间二选一
+- 返回 1 个最佳站点 + 1 个备选（可为空）
+- 最多 3 条理由
+- `detour_needed` 与 `estimated_charge_minutes`
 
-This v1 intentionally uses **fixed mock station data** (no real APIs) to validate Task App flow.
+## 本次修复范围（仅接入层）
 
-## Scope
+本次只升级 MCP transport，未改动充电决策业务逻辑：
 
-This app does **not** provide lists, maps, or discovery UX. It returns one decision-card-style result.
+- 保留原有工具名与输入/输出结构
+- 增加与官方 examples 一致的 MCP 接入形态兼容：
+  - `GET /mcp`（SSE 建链）
+  - `POST /mcp/messages?sessionId=...`（会话消息）
+- 同时保留 `POST /mcp` 直连 JSON-RPC，便于调试
 
-## Files
-
-- `server.py` — HTTP server with required web routes and MCP JSON-RPC handler.
-- `README.md` — setup and usage.
-- `DELIVERY_REPORT.md` — implementation and self-test notes.
-
-## Run
+## 运行
 
 ```bash
 python server.py
 ```
 
-## Required Endpoints
+## 必要 HTTP 路由
 
 - `GET /health`
 - `GET /privacy`
@@ -32,16 +31,18 @@ python server.py
 - `GET /support`
 - `GET /.well-known/openai-apps-challenge`
 - `GET /mcp`
+- `POST /mcp/messages?sessionId=...`
 - `POST /mcp`
 
-## MCP Methods Supported (`POST /mcp`)
+## Developer Mode 创建页 URL（必须填）
 
-- `initialize`
-- `notifications/initialized`
-- `tools/list`
-- `tools/call`
+在 ChatGPT Developer Mode 创建页中，MCP URL 请填写：
 
-## Single Tool Contract
+**`https://<your-ngrok-subdomain>.ngrok-free.app/mcp`**
+
+> 不要填 `/health` 或根路径，必须是 `/mcp`。
+
+## Tool Contract（保持不变）
 
 ### Tool name
 
@@ -49,11 +50,11 @@ python server.py
 
 ### Inputs
 
-- `battery_percent` (required)
-- `destination` (required)
-- `urgency_level` (optional: `low|medium|high`, default `medium`)
+- `battery_percent`（必填）
+- `destination`（必填）
+- `urgency_level`（可选：`low|medium|high`，默认 `medium`）
 
-### Output (deterministic)
+### Output
 
 - `best_station`
 - `backup_station`
@@ -61,31 +62,3 @@ python server.py
 - `recommendation`
 - `detour_needed`
 - `estimated_charge_minutes`
-
-## Quick cURL Examples
-
-### initialize
-
-```bash
-curl -s http://localhost:8000/mcp \
-  -H 'content-type: application/json' \
-  -d '{"jsonrpc":"2.0","id":"1","method":"initialize","params":{}}'
-```
-
-### tools/list
-
-```bash
-curl -s http://localhost:8000/mcp \
-  -H 'content-type: application/json' \
-  -d '{"jsonrpc":"2.0","id":"2","method":"tools/list","params":{}}'
-```
-
-### tools/call
-
-```bash
-curl -s http://localhost:8000/mcp \
-  -H 'content-type: application/json' \
-  -d '{"jsonrpc":"2.0","id":"3","method":"tools/call","params":{"name":"charging_planner","arguments":{"battery_percent":22,"destination":"Downtown Office","urgency_level":"high"}}}'
-```
-
-The response includes a short card-style text summary plus deterministic structured data.

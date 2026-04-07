@@ -1,63 +1,64 @@
-# DELIVERY REPORT — Charging Planner v1
+# DELIVERY REPORT — Charging Planner MCP 接入层修复
 
-## Delivered Files
+## 变更范围说明
+
+本次是“接入层修复”，不是业务重做：
+
+- 保留原有 `charging_planner` 单工具与决策逻辑（站点排序、充电时长估算、输出字段均未改动）
+- 仅升级 MCP transport 兼容形态
+
+## 已完成内容
+
+1. MCP 接入层升级
+   - 增加官方 examples 兼容路径：
+     - `GET /mcp`（SSE 建链，返回 `event: endpoint`）
+     - `POST /mcp/messages?sessionId=...`（会话消息）
+   - 保留 `POST /mcp` 直连 JSON-RPC，方便调试与兼容。
+
+2. 单工具业务逻辑保持不变
+   - 仍仅暴露 `charging_planner`
+   - 输入输出契约未变
+   - 站点选择与理由生成逻辑未变
+
+3. README 已写明创建页 URL
+   - 创建页必须填：`https://<your-ngrok-subdomain>.ngrok-free.app/mcp`
+
+## 真实联调/验证记录
+
+### A. 创建页接入形态验证（按官方 examples transport）
+
+- 已真实执行 `GET /mcp` 建立 SSE，会返回：
+  - `event: endpoint`
+  - `data: /mcp/messages?sessionId=<uuid>`
+- 已真实执行 `POST /mcp/messages?sessionId=<uuid>` 发起 `tools/call`
+- 已真实在 SSE 通道收到 `event: message` 返回结果
+
+结论：创建页所需 transport 形态（SSE + messages）已可用。
+
+### B. 真实测试语触发（按要求）
+
+测试语：
+
+> “我现在电量 18%，20 分钟后要去市中心，顺路帮我选一个最合适的充电方案，不要给我长列表，直接告诉我推荐结果和原因。”
+
+对应工具调用参数：
+
+- `battery_percent=18`
+- `destination="市中心"`
+- `urgency_level="high"`
+
+返回推荐结果（真实执行结果）：
+
+- 推荐：`charge now`
+- 最佳站点：`Destination Mall Supercharger`
+- 备选站点：`Downtown ChargePoint Plaza`
+- 原因：
+  1. 速度与路线影响平衡
+  2. 预计充电约 99 分钟
+  3. 当前电量低且紧急，先充电可降低风险
+
+## 交付文件
 
 - `server.py`
 - `README.md`
 - `DELIVERY_REPORT.md`
-
-## What Was Implemented
-
-### 1) Single-purpose deterministic decision app
-Implemented one MCP tool only: `charging_planner`.
-
-### 2) Required HTTP routes
-All required routes were added:
-
-- `GET /health`
-- `GET /privacy`
-- `GET /terms`
-- `GET /support`
-- `GET /.well-known/openai-apps-challenge`
-- `GET /mcp`
-- `POST /mcp`
-
-### 3) MCP JSON-RPC support on `POST /mcp`
-Implemented method handling for:
-
-- `initialize`
-- `notifications/initialized`
-- `tools/list`
-- `tools/call`
-
-### 4) Tool contract
-`charging_planner` accepts:
-
-- `battery_percent`
-- `destination`
-- `urgency_level` (optional)
-
-Returns deterministic structured result fields:
-
-- `best_station`
-- `backup_station`
-- `reasons` (max 3)
-- `recommendation` (`charge now` or `charge near destination`)
-- `detour_needed`
-- `estimated_charge_minutes`
-
-### 5) v1 fixed mock data only
-No real charging APIs or live map/routing APIs are used.
-
-## Self-Test Checklist
-
-- [x] `/health` responds with status JSON
-- [x] `initialize` method works
-- [x] `tools/list` returns one tool (`charging_planner`)
-- [x] `tools/call` returns deterministic decision-card structure
-- [x] repeated same input returns same result
-
-## Notes
-
-- Design intentionally avoids list-heavy outputs.
-- Result is centered around a first-screen decision card style summary.
